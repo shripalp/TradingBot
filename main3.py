@@ -22,7 +22,7 @@ def safe_async_call(coro):
 # Fetch historical stock data
 async def get_stock_data(symbol, duration='30 D', bar_size='1 hour'):
     """Fetch historical stock data asynchronously from IBKR."""
-    print(f"📡 Fetching market data for {symbol}...")
+    print(f"📡 Fetching market data for {symbol}(delayed)...")
 
     contract = Stock(symbol, 'SMART', 'USD')
     bars = await ib.reqHistoricalDataAsync(
@@ -31,7 +31,8 @@ async def get_stock_data(symbol, duration='30 D', bar_size='1 hour'):
         durationStr=duration,
         barSizeSetting=bar_size,
         whatToShow='MIDPOINT',
-        useRTH=True
+        useRTH=True,
+        
     )
 
     if not bars:
@@ -68,7 +69,7 @@ def calculate_moving_averages(df):
 def check_breakout(df, period=50):
     """Check if the stock breaks out above 20-day high."""
     df['20_day_high'] = df['close'].rolling(period).max()
-    df['Breakout'] = df['close'] > df['20_day_high'].shift(1)
+    df['Breakout'] = (df['close'] > df['20_day_high']) & (df['volume'] > df['volume'].rolling(20).mean())
     return df
 
 def log_trade_signals(symbol, df):
@@ -85,16 +86,63 @@ def log_trade_signals(symbol, df):
     print(f"   - Breakout Signal: {'YES' if breakout_signal else 'NO'}")
     
 async def get_account_balance():
-    """Fetch account balance for the selected account."""
-    balance = ib.accountSummary(account=PREFERRED_ACCOUNT)
-    print(f"💰 Account Balance for {PREFERRED_ACCOUNT}: {balance}")
-    return balance
+    """Fetch and display IBKR account balance details asynchronously."""
+    print("\n🔄 Fetching IBKR account balance...")
+
+    # Fetch account summary asynchronously
+    account_summary = await ib.accountSummaryAsync()
+
+    if not account_summary:
+        print("⚠ Unable to fetch account balance.")
+        return
+
+    # Extract values from the list
+    net_liq = cash_balance = buying_power = None
+
+    for item in account_summary:
+        if item.tag == 'NetLiquidation':
+            net_liq = float(item.value)
+        elif item.tag == 'CashBalance':
+            cash_balance = float(item.value)
+        elif item.tag == 'BuyingPower':
+            buying_power = float(item.value)
+
+    # Check if values were found
+    if net_liq is None or cash_balance is None or buying_power is None:
+        print("⚠ Could not retrieve all account values.")
+        return
+
+    print("\n💰 Account Balance:")
+    print("=" * 50)
+    print(f"💵 Cash Balance: ${cash_balance:,.2f}")
+    print(f"📊 Net Liquidation Value: ${net_liq:,.2f}")
+    print(f"⚡ Buying Power: ${buying_power:,.2f}")
+    print("=" * 50)
 
 async def get_positions():
-    """Fetch open positions for the selected account."""
-    positions = ib.positions(account=PREFERRED_ACCOUNT)
-    print(f"📊 Open Positions in {PREFERRED_ACCOUNT}: {positions}")
-    return positions
+    """Fetch open positions for the IBKR account and display them."""
+    positions = ib.positions()
+    
+    if not positions:
+        print("📭 No open positions found.")
+        return
+
+    print("\n📊 Open Positions:")
+    print("=" * 50)
+    
+    for position in positions:
+        symbol = position.contract.symbol
+        quantity = position.position
+        avg_cost = position.avgCost
+        market_price = ib.reqMktData(position.contract, snapshot=True).last
+        unrealized_pnl = (market_price - avg_cost) * quantity if market_price else "N/A"
+
+        print(f"📈 {symbol}: {quantity} shares")
+        print(f"   - Average Cost: ${avg_cost:.2f}")
+        print(f"   - Current Price: ${market_price:.2f}" if market_price else "   - Current Price: Not available")
+        print(f"   - Unrealized P&L: ${unrealized_pnl:.2f}" if isinstance(unrealized_pnl, float) else "   - Unrealized P&L: Not available")
+        print("-" * 50)
+
 
 async def cancel_order(symbol):
     """Cancel an open order for a given stock."""
@@ -217,15 +265,15 @@ async def monitor_trades(market_data_cache):
 
 # Run Trading Strategy
 async def run_trading_bot():
-    """Runs the trading strategy, logs signals, and executes limit orders efficiently."""
-    print("🔄 Running trading bot cycle...")
-    
-      # Display account balance and open positions before trading
-    #safe_async_call(get_account_balance())  # Use safe wrapper
-    #safe_async_call(get_positions())  # Use safe wrapper
+    """Runs the trading strategy and displays account info."""
+    print("\n🔄 Running trading bot cycle...")
 
-    stocks = ["AAPL", "TSLA", "NVDA", "MSFT"]
-    market_data_cache = {}  # Store market data to avoid duplicate requests
+    # Display account balance and open positions before trading
+    await get_account_balance()
+    await get_positions()
+
+    stocks = ["intc"]
+    market_data_cache = {}
 
     # Fetch market data once per stock
     tasks = [get_stock_data(stock) for stock in stocks]
@@ -235,35 +283,24 @@ async def run_trading_bot():
     for i, stock in enumerate(stocks):
         if stock_data_list[i] is not None:
             market_data_cache[stock] = stock_data_list[i]
-            print(f"📝 Stored market data for {stock} in cache.")
 
-    # Process trade signals
+    # Execute trade signals
     for stock, df in market_data_cache.items():
-        # Calculate indicators
         df = calculate_rsi(df)
         df = calculate_moving_averages(df)
         df = check_breakout(df)
 
-        # Log trade signals
         log_trade_signals(stock, df)
 
         latest_rsi = df['RSI'].iloc[-1]
-        latest_sma_50 = df['SMA_50'].iloc[-1]
-        latest_sma_200 = df['SMA_200'].iloc[-1]
         breakout_signal = df['Breakout'].iloc[-1]
         current_price = df['close'].iloc[-1]
         breakout_price = df['20_day_high'].iloc[-1]
 
-        # Set limit price (adjustable logic)
-        limit_price = current_price * 0.995  # Buy slightly below current price
+        limit_price = current_price * 0.995  # Buy slightly below market price
 
-        # Check conditions for buying
         if latest_rsi < 30 and stock not in trade_log:
             print(f"📢 BUY {stock} - RSI Oversold")
-            await place_order(stock, 1, "BUY", limit_price)
-
-        elif latest_sma_50 > latest_sma_200 and stock not in trade_log:
-            print(f"📢 BUY {stock} - Golden Cross Detected")
             await place_order(stock, 1, "BUY", limit_price)
 
         elif breakout_signal and (stock not in trade_log or trade_log[stock]["last_breakout"] != breakout_price):
@@ -271,7 +308,8 @@ async def run_trading_bot():
             await place_order(stock, 1, "BUY", limit_price, breakout_price=breakout_price)
 
     await monitor_trades(market_data_cache)
-   
+
+    
     
 # Main loop to run the bot continuously
 async def main():
@@ -279,7 +317,7 @@ async def main():
     while True:
         await run_trading_bot()
         print("⏳ Waiting for next cycle...")
-        await asyncio.sleep(60)  # Runs every 5 minutes
+        await asyncio.sleep(300)  # Runs every 5 minutes
 
 # Async loop fix for Windows
 if __name__ == "__main__":
