@@ -1,78 +1,133 @@
-from ib_insync import IB, Stock, util, MarketOrder, LimitOrder
+import asyncio
+import threading
+import time
+import schedule
+from ib_insync import IB, Stock, MarketOrder, util
 import pandas as pd
-import ta  # Technical analysis library
+import ta
 
-# Connect to IBKR
+# Create a global IB instance
 ib = IB()
-ib.connect('127.0.0.1', 7497, clientId=1)
 
-# Define stock (AAPL - Apple Inc.)
-contract = Stock('TSLA', 'SMART', 'USD')
-ib.qualifyContracts(contract)
+# Create a global asyncio event loop
+loop = asyncio.new_event_loop()
 
-# Fetch historical data (past 30 days)
-bars = ib.reqHistoricalData(
-    contract,
-    endDateTime='',
-    durationStr='2 M',
-    barSizeSetting='1 day',
-    whatToShow='ADJUSTED_LAST',
-    useRTH=True
-)
+def start_loop():
+    """ Runs the asyncio event loop in a separate thread. """
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
-# Convert data to Pandas DataFrame
-df = util.df(bars)
+# Start the background event loop thread
+threading.Thread(target=start_loop, daemon=True).start()
 
+async def connect_ibkr():
+    """ Asynchronously connects to IBKR TWS, ensuring a clean reconnect if needed. """
+    if ib.isConnected():
+        print("🔌 Closing existing IBKR connection...")
+        ib.disconnect()
+        await asyncio.sleep(2)  # Ensures full disconnect
 
-# Calculate RSI, MACD, Bollinger Bands
-df['RSI'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-df['MACD'] = ta.trend.MACD(df['close'], window_slow=26, window_fast=12, window_sign=9).macd()
-bollinger = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-df['Bollinger_Upper'] = bollinger.bollinger_hband()
-df['Bollinger_Lower'] = bollinger.bollinger_lband()
+    print("🔄 Connecting to IBKR...")
+    for _ in range(5):  # Retry up to 5 times
+        try:
+            await ib.connectAsync('127.0.0.1', 7497, clientId=1)
+            if ib.isConnected():
+                print("✅ Successfully connected to IBKR API!")
+                return  # Exit function as soon as connected
+        except Exception as ex:
+            print(f"❌ IBKR Connection Error: {ex}")
 
-# Drop NaN values to avoid errors
-df = df.dropna()
+        print("🔄 Retrying connection in 5 seconds...")
+        await asyncio.sleep(5)
 
-df['Buy_Signal'] = (df['RSI'] < 45) & (df['close'] < df['Bollinger_Lower'])
-df['Sell_Signal'] = (df['RSI'] > 55) & (df['close'] > df['Bollinger_Upper'])
-
-
-print(df[['date', 'close', 'RSI', 'MACD', 'Bollinger_Upper', 'Bollinger_Lower', 'Buy_Signal', 'Sell_Signal']].tail(20))
+    print("❌ Failed to connect to IBKR after multiple attempts.")
 
 
+async def fetch_market_data():
+    """ Fetch historical data and calculate indicators asynchronously. """
+    if not ib.isConnected():
+        print("❌ Cannot fetch market data: IBKR is not connected.")
+        return None, None
 
-print(df[['RSI', 'MACD', 'Bollinger_Upper', 'Bollinger_Lower']].isna().sum())
+    contract = Stock('TSLA', 'SMART', 'USD')
 
-df.loc[df.index[-1], 'Buy_Signal'] = True  # Force Buy Signal
-df.loc[df.index[-1], 'Sell_Signal'] = False  # Disable Sell Signal
-# Check latest Buy/Sell signal
-latest_data = df.iloc[-1]
+    try:
+        await ib.qualifyContractsAsync(contract)
 
-if latest_data['Buy_Signal']:
-    print("🔹 Buy Signal Detected! Placing Buy Order...")
-    order = MarketOrder('BUY', 10)  # Buy 10 shares
-    trade = ib.placeOrder(contract, order)
+        bars = await ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime='',
+            durationStr='6 M',
+            barSizeSetting='1 day',
+            whatToShow='ADJUSTED_LAST',
+            useRTH=True
+        )
 
-elif latest_data['Sell_Signal']:
-    print("🔸 Sell Signal Detected! Placing Sell Order...")
-    order = MarketOrder('SELL', 10)  # Sell 10 shares
-    trade = ib.placeOrder(contract, order)
+        df = util.df(bars)
 
-else:
-    print("📉 No trade signals detected.")
-    
-entry_price = latest_data['close']
-stop_loss = entry_price * 0.95  # 5% below entry
-take_profit = entry_price * 1.10  # 10% above entry
+        # Indicators
+        df['RSI'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+        bollinger = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+        df['Bollinger_Upper'] = bollinger.bollinger_hband()
+        df['Bollinger_Lower'] = bollinger.bollinger_lband()
 
-if latest_data['Buy_Signal']:
-    print(f"🔹 Buy Order at ${entry_price:.2f} with Stop-Loss at ${stop_loss:.2f} and Take-Profit at ${take_profit:.2f}")
-    order = LimitOrder('BUY', 10, entry_price)  # Buy at entry price
-    trade = ib.placeOrder(contract, order)
+        df.dropna(inplace=True)
 
-elif latest_data['Sell_Signal']:
-    print(f"🔸 Sell Order at ${entry_price:.2f} with Stop-Loss at ${take_profit:.2f} and Take-Profit at ${stop_loss:.2f}")
-    order = LimitOrder('SELL', 10, entry_price)
-    trade = ib.placeOrder(contract, order)
+        # Buy/Sell logic
+        df['Buy_Signal'] = (df['RSI'] < 40) & (df['close'] < df['Bollinger_Lower'])
+        df['Sell_Signal'] = (df['RSI'] > 60) & (df['close'] > df['Bollinger_Upper'])
+
+        return df, contract
+    except Exception as ex:
+        print(f"❌ Error fetching market data: {ex}")
+        return None, None
+
+
+async def execute_trades():
+    """ Checks for Buy/Sell signals and executes trades via IBKR. """
+    df, contract = await fetch_market_data()
+    if df is None or contract is None:
+        print("⚠️ Skipping trade execution due to missing market data.")
+        return
+
+    latest = df.iloc[-1]
+    print(latest[['date', 'close', 'RSI', 'Buy_Signal', 'Sell_Signal']])
+
+    if latest['Buy_Signal']:
+        print(f"🔹 Buy Signal at {latest['close']:.2f}, placing BUY order.")
+        order = MarketOrder('BUY', 10)
+        ib.placeOrder(contract, order)
+    elif latest['Sell_Signal']:
+        print(f"🔸 Sell Signal at {latest['close']:.2f}, placing SELL order.")
+        order = MarketOrder('SELL', 10)
+        ib.placeOrder(contract, order)
+    else:
+        print("📉 No trade signals detected this run.")
+
+def run_trading_bot():
+    """ Called by schedule every X minutes. Push async tasks to the background loop. """
+    print("🔄 Checking for new trade signals...")
+
+    # Step 1: Ensure IBKR is connected before anything else
+    connect_future = asyncio.run_coroutine_threadsafe(connect_ibkr(), loop)
+    connect_future.result(timeout=60)  # Wait until IBKR is connected
+
+    if not ib.isConnected():
+        print("❌ Skipping trade execution because IBKR is not connected.")
+        return  # Don't proceed with fetching data
+
+    # Step 2: Execute trades only if IBKR is connected
+    asyncio.run_coroutine_threadsafe(execute_trades(), loop)
+
+# 🔥 Set to Run Every 1 Minute for Testing
+schedule.every(1).minutes.do(run_trading_bot)
+
+print("🚀 Trading Bot Started. Checking for signals every 1 minute.")
+
+while True:
+    schedule.run_pending()
+    time.sleep(1)
+
+
+
 
