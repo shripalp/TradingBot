@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from ib_insync import *
 import datetime
+import csv
 
 # Connect to IBKR
 ib = IB()
@@ -20,31 +21,42 @@ def safe_async_call(coro):
     return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
 # Fetch historical stock data
-async def get_stock_data(symbol, duration='30 D', bar_size='1 hour'):
-    """Fetch historical stock data asynchronously from IBKR."""
-    print(f"📡 Fetching market data for {symbol}(delayed)...")
+async def get_stock_data(symbol, duration='1 Y', bar_size='1 day'):
+    """Fetch historical stock data as a DataFrame."""
+    print(f"📡 Fetching market data for {symbol}...")
 
     contract = Stock(symbol, 'SMART', 'USD')
-    bars = await ib.reqHistoricalDataAsync(
-        contract,
-        endDateTime='',
-        durationStr=duration,
-        barSizeSetting=bar_size,
-        whatToShow='MIDPOINT',
-        useRTH=True,
-        
-    )
+    tick = ib.reqMktData(contract, genericTickList="", snapshot=True)
+
+    if tick.last is not None:
+        print(f"✅ {symbol} Delayed Price: ${tick.last:.2f}")
+    else:
+        print("⚠ No market data available. Ensure delayed data is enabled.")
+    
+    try:
+        bars = await ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime='',
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow='MIDPOINT',
+            useRTH=True
+        )
+    except Exception as e:
+        print(f"⚠ Error fetching market data for {symbol}: {e}")
+        return None  # Return None if data fetch fails
+
 
     if not bars:
         print(f"⚠ No historical data found for {symbol}. Skipping.")
-        return None
+        return None  # ✅ Return None to prevent errors
 
     df = pd.DataFrame(bars)
-    df['close'] = df['close'].astype(float)
+    df['close'] = df['close'].astype(float)  # ✅ Ensure column exists
 
     print(f"✅ Received {len(df)} data points for {symbol}. Latest close: ${df['close'].iloc[-1]:.2f}")
-    return df
-
+    return df  # ✅ Return a DataFrame
+    
 # Calculate RSI
 def calculate_rsi(df, period=14):
     """Calculate RSI (Relative Strength Index)."""
@@ -120,27 +132,49 @@ async def get_account_balance():
     print("=" * 50)
 
 async def get_positions():
-    """Fetch open positions for the IBKR account and display them."""
+    """Fetch open positions and ensure market data is available."""
     positions = ib.positions()
-    
+
     if not positions:
         print("📭 No open positions found.")
         return
 
     print("\n📊 Open Positions:")
     print("=" * 50)
-    
+
     for position in positions:
         symbol = position.contract.symbol
         quantity = position.position
         avg_cost = position.avgCost
-        market_price = ib.reqMktData(position.contract, snapshot=True).last
-        unrealized_pnl = (market_price - avg_cost) * quantity if market_price else "N/A"
+        contract = Stock(symbol, 'SMART', 'USD')  # ✅ Use SMART Routing
+
+        try:
+            tick = ib.reqMktData(contract, genericTickList="", snapshot=True)
+            await asyncio.sleep(2)  # ✅ Wait for IBKR to return data
+
+            if tick.last is not None:
+                current_price = tick.last
+                unrealized_pnl = (current_price - avg_cost) * quantity
+            else:
+                # ✅ Handle missing market data for IBKR stock specifically
+                if symbol == "IBKR":
+                    print(f"⚠ No real-time data available for {symbol}. Using last known price.")
+                    current_price = avg_cost  # Use last known value
+                    unrealized_pnl = 0.0
+                else:
+                    print(f"⚠ No real-time market data for {symbol}.")
+                    current_price = avg_cost
+                    unrealized_pnl = 0.0
+
+        except Exception as e:
+            print(f"⚠ Error fetching market data for {symbol}: {e}")
+            current_price = avg_cost
+            unrealized_pnl = 0.0
 
         print(f"📈 {symbol}: {quantity} shares")
         print(f"   - Average Cost: ${avg_cost:.2f}")
-        print(f"   - Current Price: ${market_price:.2f}" if market_price else "   - Current Price: Not available")
-        print(f"   - Unrealized P&L: ${unrealized_pnl:.2f}" if isinstance(unrealized_pnl, float) else "   - Unrealized P&L: Not available")
+        print(f"   - Current Price: ${current_price:.2f}")
+        print(f"   - Unrealized P&L: ${unrealized_pnl:.2f}")
         print("-" * 50)
 
 
@@ -168,13 +202,20 @@ async def cancel_order(symbol):
     print(f"⚠ No open order found for {symbol}.")
 
 
+def log_trade(symbol, action, price, quantity, status):
+    """Logs trades to a CSV file for debugging."""
+    with open("trade_log.csv", "a", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([datetime.datetime.now(), symbol, action, price, quantity, status])
+
+
 
 
 
 # Trade tracking
 trade_log = {}
 
-async def place_order(symbol, quantity, action, limit_price, breakout_price=None, stop_loss_pct=3, take_profit_pct=10):
+async def place_order(symbol, quantity, action, limit_price, breakout_price=None, stop_loss_pct=3, take_profit_pct=5):
     """Places a Limit Order asynchronously and ensures order_time is set for pending trades."""
     
     
@@ -186,7 +227,7 @@ async def place_order(symbol, quantity, action, limit_price, breakout_price=None
     contract = Stock(symbol, 'SMART', 'USD')
 
     # Define limit order
-    order = LimitOrder(action, quantity, limit_price)
+    order = LimitOrder(action, quantity, limit_price, account=PREFERRED_ACCOUNT)
     
     trade = ib.placeOrder(contract, order)
     await asyncio.sleep(2)  # Allow order execution time
@@ -215,7 +256,7 @@ async def place_order(symbol, quantity, action, limit_price, breakout_price=None
             "last_breakout": breakout_price,
             "limit_price": limit_price
         }
-
+        log_trade(symbol, action, limit_price, quantity, trade.orderStatus.status)
         print(f"✅ Trade Executed: {action} {quantity} shares of {symbol} at ${entry_price:.2f}")
         print(f"   - 🛑 Stop-Loss: ${stop_loss_price:.2f}")
         print(f"   - 🎯 Take-Profit: ${take_profit_price:.2f}")
@@ -272,9 +313,10 @@ async def run_trading_bot():
     await get_account_balance()
     await get_positions()
 
-    stocks = ["intc"]
+    stocks = ["MSFT", "AAPL", "TSLA", "NVDA"]
     market_data_cache = {}
-
+    
+  
     # Fetch market data once per stock
     tasks = [get_stock_data(stock) for stock in stocks]
     stock_data_list = await asyncio.gather(*tasks)
