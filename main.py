@@ -1,133 +1,376 @@
 import asyncio
-import threading
-import time
-import schedule
-from ib_insync import IB, Stock, MarketOrder, util
 import pandas as pd
-import ta
+import numpy as np
+from ib_insync import *
+import datetime
+import csv
 
-# Create a global IB instance
+# Connect to IBKR
 ib = IB()
 
-# Create a global asyncio event loop
-loop = asyncio.new_event_loop()
-
-def start_loop():
-    """ Runs the asyncio event loop in a separate thread. """
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
-
-# Start the background event loop thread
-threading.Thread(target=start_loop, daemon=True).start()
+PREFERRED_ACCOUNT = 'DUA296813'  # IBKR account number
 
 async def connect_ibkr():
-    """ Asynchronously connects to IBKR TWS, ensuring a clean reconnect if needed. """
-    if ib.isConnected():
-        print("🔌 Closing existing IBKR connection...")
-        ib.disconnect()
-        await asyncio.sleep(2)  # Ensures full disconnect
+    """Asynchronously connects to IBKR TWS or IB Gateway"""
+    await ib.connectAsync('127.0.0.1', 7497, clientId=1)
+    print("✅ Connected to IBKR")
+    
+def safe_async_call(coro):
+    """Safely run an async function from a synchronous environment."""
+    loop = asyncio.get_event_loop()
+    return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
-    print("🔄 Connecting to IBKR...")
-    for _ in range(5):  # Retry up to 5 times
-        try:
-            await ib.connectAsync('127.0.0.1', 7497, clientId=1)
-            if ib.isConnected():
-                print("✅ Successfully connected to IBKR API!")
-                return  # Exit function as soon as connected
-        except Exception as ex:
-            print(f"❌ IBKR Connection Error: {ex}")
+# Fetch historical stock data
+async def get_stock_data(symbol, duration='1 Y', bar_size='1 day'):
+    """Fetch historical stock data, including volume."""
+    print(f"📡 Fetching market data for {symbol}...")
 
-        print("🔄 Retrying connection in 5 seconds...")
-        await asyncio.sleep(5)
-
-    print("❌ Failed to connect to IBKR after multiple attempts.")
-
-
-async def fetch_market_data():
-    """ Fetch historical data and calculate indicators asynchronously. """
-    if not ib.isConnected():
-        print("❌ Cannot fetch market data: IBKR is not connected.")
-        return None, None
-
-    contract = Stock('TSLA', 'SMART', 'USD')
-
+    contract = Stock(symbol, 'SMART', 'USD')
     try:
-        await ib.qualifyContractsAsync(contract)
-
         bars = await ib.reqHistoricalDataAsync(
             contract,
             endDateTime='',
-            durationStr='6 M',
-            barSizeSetting='1 day',
-            whatToShow='ADJUSTED_LAST',
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow='TRADES',  # ✅ Ensure volume is included
             useRTH=True
         )
 
-        df = util.df(bars)
+        if not bars:
+            print(f"⚠ No historical data found for {symbol}. Skipping.")
+            return None
 
-        # Indicators
-        df['RSI'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-        bollinger = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
-        df['Bollinger_Upper'] = bollinger.bollinger_hband()
-        df['Bollinger_Lower'] = bollinger.bollinger_lband()
+        df = pd.DataFrame(bars)
+        df['close'] = df['close'].astype(float)
 
-        df.dropna(inplace=True)
+        # ✅ Ensure 'volume' column exists
+        if 'volume' not in df.columns:
+            df['volume'] = np.nan  # Add empty column to prevent KeyError
 
-        # Buy/Sell logic
-        df['Buy_Signal'] = (df['RSI'] < 40) & (df['close'] < df['Bollinger_Lower'])
-        df['Sell_Signal'] = (df['RSI'] > 60) & (df['close'] > df['Bollinger_Upper'])
+        print(f"✅ Received {len(df)} data points for {symbol}. Latest close: ${df['close'].iloc[-1]:.2f}")
+        return df
 
-        return df, contract
-    except Exception as ex:
-        print(f"❌ Error fetching market data: {ex}")
-        return None, None
+    except Exception as e:
+        print(f"⚠ Error fetching market data for {symbol}: {e}")
+        return None
 
+    
+# Calculate RSI
+def calculate_rsi(df, period=14):
+    """Calculate RSI (Relative Strength Index)."""
+    delta = df['close'].diff()
+    gain = np.where(delta > 0, delta, 0).astype(float)
+    loss = np.where(delta < 0, -delta, 0).astype(float)
 
-async def execute_trades():
-    """ Checks for Buy/Sell signals and executes trades via IBKR. """
-    df, contract = await fetch_market_data()
-    if df is None or contract is None:
-        print("⚠️ Skipping trade execution due to missing market data.")
+    avg_gain = pd.Series(gain).rolling(window=period, min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(window=period, min_periods=1).mean()
+    rs = avg_gain / avg_loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    return df
+
+# Calculate Moving Averages
+def calculate_moving_averages(df):
+    """Calculate 50-day and 200-day moving averages."""
+    df['SMA_50'] = df['close'].rolling(50).mean()
+    df['SMA_200'] = df['close'].rolling(200).mean()
+    return df
+
+# Detect Breakouts
+def check_breakout(df, period=50):
+    """Check if the stock breaks out above 20-day high."""
+    df['20_day_high'] = df['close'].rolling(period).max()
+    df['Breakout'] = (df['close'] > df['20_day_high']) & (df['volume'] > df['volume'].rolling(20).mean())
+    return df
+
+def log_trade_signals(symbol, df):
+    """Log trade signals for debugging."""
+    latest_rsi = df['RSI'].iloc[-1]
+    latest_sma_50 = df['SMA_50'].iloc[-1]
+    latest_sma_200 = df['SMA_200'].iloc[-1]
+    breakout_signal = df['Breakout'].iloc[-1]
+
+    print(f"📊 Checking trade signals for {symbol}:")
+    print(f"   - RSI: {latest_rsi:.2f} (Oversold < 30)")
+    print(f"   - 50 SMA: {latest_sma_50:.2f}")
+    print(f"   - 200 SMA: {latest_sma_200:.2f}")
+    print(f"   - Breakout Signal: {'YES' if breakout_signal else 'NO'}")
+    
+async def get_account_balance():
+    """Fetch and display IBKR account balance details asynchronously."""
+    print("\n🔄 Fetching IBKR account balance...")
+
+    # Fetch account summary asynchronously
+    account_summary = await ib.accountSummaryAsync()
+
+    if not account_summary:
+        print("⚠ Unable to fetch account balance.")
         return
 
-    latest = df.iloc[-1]
-    print(latest[['date', 'close', 'RSI', 'Buy_Signal', 'Sell_Signal']])
+    # Extract values from the list
+    net_liq = cash_balance = buying_power = None
 
-    if latest['Buy_Signal']:
-        print(f"🔹 Buy Signal at {latest['close']:.2f}, placing BUY order.")
-        order = MarketOrder('BUY', 10)
-        ib.placeOrder(contract, order)
-    elif latest['Sell_Signal']:
-        print(f"🔸 Sell Signal at {latest['close']:.2f}, placing SELL order.")
-        order = MarketOrder('SELL', 10)
-        ib.placeOrder(contract, order)
+    for item in account_summary:
+        if item.tag == 'NetLiquidation':
+            net_liq = float(item.value)
+        elif item.tag == 'CashBalance':
+            cash_balance = float(item.value)
+        elif item.tag == 'BuyingPower':
+            buying_power = float(item.value)
+
+    # Check if values were found
+    if net_liq is None or cash_balance is None or buying_power is None:
+        print("⚠ Could not retrieve all account values.")
+        return
+
+    print("\n💰 Account Balance:")
+    print("=" * 50)
+    print(f"💵 Cash Balance: ${cash_balance:,.2f}")
+    print(f"📊 Net Liquidation Value: ${net_liq:,.2f}")
+    print(f"⚡ Buying Power: ${buying_power:,.2f}")
+    print("=" * 50)
+
+async def get_positions():
+    """Fetch open positions and ensure market data is available."""
+    positions = ib.positions()
+
+    if not positions:
+        print("📭 No open positions found.")
+        return
+
+    print("\n📊 Open Positions:")
+    print("=" * 50)
+
+    for position in positions:
+        symbol = position.contract.symbol
+        quantity = position.position
+        avg_cost = position.avgCost
+        contract = Stock(symbol, 'SMART', 'USD')  # ✅ Use SMART Routing
+
+        try:
+            tick = ib.reqMktData(contract, genericTickList="", snapshot=True)
+            await asyncio.sleep(2)  # ✅ Wait for IBKR to return data
+
+            if tick.last is not None:
+                current_price = tick.last
+                unrealized_pnl = (current_price - avg_cost) * quantity
+            else:
+                # ✅ Handle missing market data for IBKR stock specifically
+                if symbol == "IBKR":
+                    print(f"⚠ No real-time data available for {symbol}. Using last known price.")
+                    current_price = avg_cost  # Use last known value
+                    unrealized_pnl = 0.0
+                else:
+                    print(f"⚠ No real-time market data for {symbol}.")
+                    current_price = avg_cost
+                    unrealized_pnl = 0.0
+
+        except Exception as e:
+            print(f"⚠ Error fetching market data for {symbol}: {e}")
+            current_price = avg_cost
+            unrealized_pnl = 0.0
+
+        print(f"📈 {symbol}: {quantity} shares")
+        print(f"   - Average Cost: ${avg_cost:.2f}")
+        print(f"   - Current Price: ${current_price:.2f}")
+        print(f"   - Unrealized P&L: ${unrealized_pnl:.2f}")
+        print("-" * 50)
+
+
+async def cancel_order(symbol):
+    """Cancel an open order for a given stock if it is still active."""
+    print(f"🚫 Attempting to cancel {symbol} order...")
+
+    # Get all open trades
+    open_trades = ib.openTrades()
+
+    found = False
+    for trade in open_trades:
+        if trade.contract.symbol == symbol:
+            found = True
+            if trade.orderStatus.status in ["PreSubmitted", "Submitted"]:  # ✅ Only cancel active orders
+                print(f"🚫 Canceling {symbol} order (Order ID: {trade.order.orderId})...")
+                ib.cancelOrder(trade.order)
+                await asyncio.sleep(2)  # ✅ Allow IBKR time to process the cancellation
+                print(f"✅ Order {trade.order.orderId} for {symbol} successfully canceled.")
+            else:
+                print(f"⚠️ Order {trade.order.orderId} for {symbol} is already filled or cancelled.")
+    
+    if not found:
+        print(f"⚠️ No active order found for {symbol}. Skipping cancellation.")
+
+
+
+def log_trade(symbol, action, price, quantity, status):
+    """Logs trades to a CSV file for debugging."""
+    with open("trade_log.csv", "a", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([datetime.datetime.now(), symbol, action, price, quantity, status])
+
+
+
+
+
+# Trade tracking
+trade_log = {}
+
+async def place_order(symbol, quantity, action, limit_price, breakout_price=None, stop_loss_pct=3, take_profit_pct=5):
+    """Places a Limit Order asynchronously and ensures order_time is set for pending trades."""
+
+    # ✅ Prevent duplicate trades at the same breakout level or if a trade is pending
+    if symbol in trade_log and (trade_log[symbol].get("status") == "pending" or trade_log[symbol].get("last_breakout") == breakout_price):
+        print(f"⏳ Skipping {symbol} - Order already placed or pending at breakout level ${breakout_price:.2f}.")
+        return  
+
+    contract = Stock(symbol, 'SMART', 'USD')
+
+    # Define limit order
+    order = LimitOrder(action, quantity, limit_price, account=PREFERRED_ACCOUNT)
+    
+    trade = ib.placeOrder(contract, order)
+    await asyncio.sleep(2)  # ✅ Allow order execution time
+
+    # ✅ Mark trade as pending and store order time
+    trade_log[symbol] = {
+        "status": "pending",
+        "last_breakout": breakout_price,
+        "order_time": datetime.datetime.now(),
+        "limit_price": limit_price  # Store the limit price
+    }
+
+    print(f"📌 Placed {action} Limit Order for {symbol}: {quantity} shares at ${limit_price:.2f}")
+
+    if trade.orderStatus.status == 'Filled':
+        entry_price = trade.orderStatus.avgFillPrice
+        stop_loss_price = entry_price * (1 - stop_loss_pct / 100)
+        take_profit_price = entry_price * (1 + take_profit_pct / 100)
+
+        # ✅ Update trade log with actual trade details
+        trade_log[symbol] = {
+            "entry_price": entry_price,
+            "stop_loss": stop_loss_price,
+            "take_profit": take_profit_price,
+            "status": "open",
+            "last_breakout": breakout_price,
+            "limit_price": limit_price
+        }
+        log_trade(symbol, action, limit_price, quantity, trade.orderStatus.status)
+        print(f"✅ Trade Executed: {action} {quantity} shares of {symbol} at ${entry_price:.2f}")
+        print(f"   - 🛑 Stop-Loss: ${stop_loss_price:.2f}")
+        print(f"   - 🎯 Take-Profit: ${take_profit_price:.2f}")
+
     else:
-        print("📉 No trade signals detected this run.")
-
-def run_trading_bot():
-    """ Called by schedule every X minutes. Push async tasks to the background loop. """
-    print("🔄 Checking for new trade signals...")
-
-    # Step 1: Ensure IBKR is connected before anything else
-    connect_future = asyncio.run_coroutine_threadsafe(connect_ibkr(), loop)
-    connect_future.result(timeout=60)  # Wait until IBKR is connected
-
-    if not ib.isConnected():
-        print("❌ Skipping trade execution because IBKR is not connected.")
-        return  # Don't proceed with fetching data
-
-    # Step 2: Execute trades only if IBKR is connected
-    asyncio.run_coroutine_threadsafe(execute_trades(), loop)
-
-# 🔥 Set to Run Every 1 Minute for Testing
-schedule.every(1).minutes.do(run_trading_bot)
-
-print("🚀 Trading Bot Started. Checking for signals every 1 minute.")
-
-while True:
-    schedule.run_pending()
-    time.sleep(1)
+        print(f"⚠ Limit Order for {symbol} not filled. Status: {trade.orderStatus.status}. Retrying in next cycle.")
 
 
+
+
+# Monitor Active Trades
+async def monitor_trades(market_data_cache):
+    """Monitors active trades and adjusts stop-loss dynamically."""
+    open_positions = ib.positions()
+
+    for position in open_positions:
+        symbol = position.contract.symbol
+        quantity = position.position
+        entry_price = trade_log.get(symbol, {}).get("entry_price")
+        stop_loss = trade_log.get(symbol, {}).get("stop_loss")
+        take_profit = trade_log.get(symbol, {}).get("take_profit")
+        current_price = market_data_cache.get(symbol, {}).get("close")
+
+        if not entry_price or not stop_loss or not take_profit or not current_price:
+            continue  # Skip if required data is missing
+
+        # ✅ Adjust stop-loss only if price is rising but below take-profit
+        if current_price > entry_price and current_price < take_profit:
+            new_stop_loss = current_price * 0.99  # Adjust stop-loss to 1% below current price
+            
+            if new_stop_loss > stop_loss:  # ✅ Ensure stop-loss only moves up
+                print(f"📈 Adjusting Stop-Loss for {symbol}: Old: ${stop_loss:.2f} → New: ${new_stop_loss:.2f}")
+                trade_log[symbol]["stop_loss"] = new_stop_loss  # ✅ Update stop-loss in trade log
+
+        # ✅ Exit trade if stop-loss is hit
+        if current_price <= stop_loss:
+            print(f"🚨 STOP-LOSS HIT: Selling {symbol} at ${current_price:.2f} (Stop-Loss: ${stop_loss:.2f})")
+            await place_order(symbol, quantity, "SELL", current_price * 0.995)  # Sell slightly below market price
+            trade_log.pop(symbol, None)  # ✅ Remove from trade log after selling
+
+        # ✅ Exit trade if take-profit is hit
+        if current_price >= take_profit:
+            print(f"🎯 TAKE-PROFIT HIT: Selling {symbol} at ${current_price:.2f} (Target: ${take_profit:.2f})")
+            await place_order(symbol, quantity, "SELL", current_price * 1.005)  # Sell slightly above market price
+            trade_log.pop(symbol, None)  # ✅ Remove from trade log after selling
+
+
+# Run Trading Strategy
+async def run_trading_bot():
+    """Runs the trading strategy and displays account info."""
+    print("\n🔄 Running trading bot cycle...")
+
+    # Display account balance and open positions before trading
+    await get_account_balance()
+    await get_positions()
+
+    stocks = ["MSFT", "AAPL", "TSLA", "NVDA"]
+    market_data_cache = {}
+    
+  
+    # Fetch market data once per stock
+    tasks = [get_stock_data(stock) for stock in stocks]
+    stock_data_list = await asyncio.gather(*tasks)
+
+    # Store data in cache
+    for i, stock in enumerate(stocks):
+        if stock_data_list[i] is not None:
+            market_data_cache[stock] = stock_data_list[i]
+
+    # Execute trade signals
+    for stock, df in market_data_cache.items():
+        df = calculate_rsi(df)
+        df = calculate_moving_averages(df)
+        df = check_breakout(df)
+
+        log_trade_signals(stock, df)
+
+        latest_rsi = df['RSI'].iloc[-1]
+        latest_sma_50 = df['SMA_50'].iloc[-1]
+        latest_sma_200 = df['SMA_200'].iloc[-1]
+        breakout_signal = df['Breakout'].iloc[-1]
+        current_price = df['close'].iloc[-1]
+        breakout_price = df['20_day_high'].iloc[-1]
+
+        limit_price = current_price * 0.995  # Buy slightly below market price
+
+         # ✅ Buy if RSI is below 30 (Oversold)
+        if latest_rsi < 30 and stock not in trade_log:
+            print(f"📢 BUY {stock} - RSI Oversold")
+            await place_order(stock, 1, "BUY", limit_price)
+            
+         # ✅ Buy if 50 SMA crosses above 200 SMA (Golden Cross)
+        elif latest_sma_50 > latest_sma_200 and stock not in trade_log:
+            print(f"📢 BUY {stock} - Golden Cross Detected (SMA_50: {latest_sma_50:.2f}, SMA_200: {latest_sma_200:.2f})")
+            await place_order(stock, 1, "BUY", limit_price)
+            
+         # ✅ Buy if breakout occurs
+        elif breakout_signal and (stock not in trade_log or trade_log[stock]["last_breakout"] != breakout_price):
+            print(f"📢 BUY {stock} - Breakout Detected at ${breakout_price:.2f}")
+            await place_order(stock, 1, "BUY", limit_price, breakout_price=breakout_price)
+
+    await monitor_trades(market_data_cache)
+
+    
+    
+# Main loop to run the bot continuously
+async def main():
+    await connect_ibkr()
+    while True:
+        await run_trading_bot()
+        print("⏳ Waiting for next cycle...")
+        await asyncio.sleep(300)  # Runs every 5 minutes
+
+# Async loop fix for Windows
+if __name__ == "__main__":
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(main())
 
 
