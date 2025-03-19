@@ -144,27 +144,16 @@ async def get_positions():
         symbol = position.contract.symbol
         quantity = position.position
         avg_cost = position.avgCost
-        stop_loss = trade_log.get(symbol, {}).get("stop_loss_price", "N/A")
-        take_profit = trade_log.get(symbol, {}).get("take_profit_price", "N/A")
-        contract = Stock(symbol, 'SMART', 'USD')  # ✅ Use SMART Routing
+        stop_loss = trade_log.get(symbol, {}).get("stop_loss", "N/A")
+        take_profit = trade_log.get(symbol, {}).get("take_profit", "N/A")
+        contract = Stock(symbol, 'SMART', 'USD')
 
         try:
             tick = ib.reqMktData(contract, genericTickList="", snapshot=True)
-            await asyncio.sleep(2)  # ✅ Wait for IBKR to return data
+            await asyncio.sleep(2)  # ✅ Allow IBKR to return data
 
-            if tick.last is not None:
-                current_price = tick.last
-                unrealized_pnl = (current_price - avg_cost) * quantity
-            else:
-                # ✅ Handle missing market data for IBKR stock specifically
-                if symbol == "IBKR":
-                    print(f"⚠ No real-time data available for {symbol}. Using last known price.")
-                    current_price = avg_cost  # Use last known value
-                    unrealized_pnl = 0.0
-                else:
-                    print(f"⚠ No real-time market data for {symbol}.")
-                    current_price = avg_cost
-                    unrealized_pnl = 0.0
+            current_price = tick.last if tick.last is not None else avg_cost  # Use last known price if missing
+            unrealized_pnl = (current_price - avg_cost) * quantity
 
         except Exception as e:
             print(f"⚠ Error fetching market data for {symbol}: {e}")
@@ -175,9 +164,10 @@ async def get_positions():
         print(f"   - Average Cost: ${avg_cost:.2f}")
         print(f"   - Current Price: ${current_price:.2f}")
         print(f"   - Unrealized P&L: ${unrealized_pnl:.2f}")
-        print(f"   - Stop=Loss: ${stop_loss}")
-        print(f"   - Take_Profit: ${take_profit}")
+        print(f"   - 🛑 Stop-Loss: ${stop_loss}")
+        print(f"   - 🎯 Take-Profit: ${take_profit}")
         print("-" * 50)
+
 
 
 async def cancel_order(symbol):
@@ -235,39 +225,32 @@ async def place_order(symbol, quantity, action, limit_price, breakout_price=None
     
     
 
-    # ✅ Mark trade as pending and store order time
+    # ✅ Calculate Stop-Loss & Take-Profit Before Order Execution
+    stop_loss_price = limit_price * (1 - stop_loss_pct / 100)
+    take_profit_price = limit_price * (1 + take_profit_pct / 100)
+
+    # ✅ Save trade details in log immediately (even if order is pending)
     trade_log[symbol] = {
         "status": "pending",
+        "entry_price": limit_price,  # Save entry price before execution
+        "stop_loss": stop_loss_price,
+        "take_profit": take_profit_price,
         "last_breakout": breakout_price,
-        "order_time": datetime.datetime.now(),
-        "limit_price": limit_price  # Store the limit price
+        "limit_price": limit_price
     }
 
     print(f"📌 Placed {action} Limit Order for {symbol}: {quantity} shares at ${limit_price:.2f}")
+    print(f"   - 🛑 Stop-Loss: ${stop_loss_price:.2f}")
+    print(f"   - 🎯 Take-Profit: ${take_profit_price:.2f}")
 
+    # ✅ Check if the order is filled and update trade log
     if trade.orderStatus.status == 'Filled':
         entry_price = trade.orderStatus.avgFillPrice
-        stop_loss_price = entry_price * (1 - stop_loss_pct / 100)
-        take_profit_price = entry_price * (1 + take_profit_pct / 100)
-
-        # ✅ Update trade log with actual trade details
-        trade_log[symbol] = {
-            "entry_price": entry_price,
-            "stop_loss": stop_loss_price,
-            "take_profit": take_profit_price,
-            "status": "open",
-            "last_breakout": breakout_price,
-            "limit_price": limit_price
-        }
-        log_trade(symbol, action, limit_price, quantity, trade.orderStatus.status)
+        trade_log[symbol]["entry_price"] = entry_price
         print(f"✅ Trade Executed: {action} {quantity} shares of {symbol} at ${entry_price:.2f}")
-        print(f"   - 🛑 Stop-Loss: ${stop_loss_price:.2f}")
-        print(f"   - 🎯 Take-Profit: ${take_profit_price:.2f}")
 
     else:
-        print(f"⚠ Limit Order for {symbol} not filled. Status: {trade.orderStatus.status}. Retrying in next cycle.")
-
-
+        print(f"⚠ Limit Order for {symbol} not filled yet. Status: {trade.orderStatus.status}. Retrying in next cycle.")
 
 
 # Monitor Active Trades
@@ -280,7 +263,7 @@ async def monitor_trades(market_data_cache):
         quantity = position.position
         entry_price = trade_log.get(symbol, {}).get("entry_price")
         stop_loss = trade_log.get(symbol, {}).get("stop_loss")
-        print(f"stop_loss={stop_loss}")
+        
         take_profit = trade_log.get(symbol, {}).get("take_profit")
         current_price = market_data_cache.get(symbol, {}).get("close")
 
