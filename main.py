@@ -144,6 +144,8 @@ async def get_positions():
         symbol = position.contract.symbol
         quantity = position.position
         avg_cost = position.avgCost
+        stop_loss = trade_log.get(symbol, {}).get("stop_loss_price", "N/A")
+        take_profit = trade_log.get(symbol, {}).get("take_profit_price", "N/A")
         contract = Stock(symbol, 'SMART', 'USD')  # ✅ Use SMART Routing
 
         try:
@@ -173,6 +175,8 @@ async def get_positions():
         print(f"   - Average Cost: ${avg_cost:.2f}")
         print(f"   - Current Price: ${current_price:.2f}")
         print(f"   - Unrealized P&L: ${unrealized_pnl:.2f}")
+        print(f"   - Stop=Loss: ${stop_loss}")
+        print(f"   - Take_Profit: ${take_profit}")
         print("-" * 50)
 
 
@@ -228,6 +232,8 @@ async def place_order(symbol, quantity, action, limit_price, breakout_price=None
     
     trade = ib.placeOrder(contract, order)
     await asyncio.sleep(2)  # ✅ Allow order execution time
+    
+    
 
     # ✅ Mark trade as pending and store order time
     trade_log[symbol] = {
@@ -274,6 +280,7 @@ async def monitor_trades(market_data_cache):
         quantity = position.position
         entry_price = trade_log.get(symbol, {}).get("entry_price")
         stop_loss = trade_log.get(symbol, {}).get("stop_loss")
+        print(f"stop_loss={stop_loss}")
         take_profit = trade_log.get(symbol, {}).get("take_profit")
         current_price = market_data_cache.get(symbol, {}).get("close")
 
@@ -310,7 +317,7 @@ async def run_trading_bot():
     await get_account_balance()
     await get_positions()
 
-    stocks = ["MSFT", "AAPL", "TSLA", "NVDA"]
+    stocks = ["NIO", "COIN", "TQQQ"]
     market_data_cache = {}
     
   
@@ -338,7 +345,7 @@ async def run_trading_bot():
         current_price = df['close'].iloc[-1]
         breakout_price = df['20_day_high'].iloc[-1]
 
-        limit_price = current_price * 0.995  # Buy slightly below market price
+        limit_price = current_price * 1.0  # Buy slightly below market price
 
          # ✅ Buy if RSI is below 30 (Oversold)
         if latest_rsi < 30 and stock not in trade_log:
