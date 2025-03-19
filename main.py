@@ -217,10 +217,10 @@ async def place_order(symbol, quantity, action, limit_price, breakout_price=None
 
     contract = Stock(symbol, 'SMART', 'USD')
 
-    # Define limit order
-    order = LimitOrder(action, quantity, limit_price, account=PREFERRED_ACCOUNT)
-    
+  # ✅ Define Market Order
+    order = MarketOrder(action, quantity, account=PREFERRED_ACCOUNT)
     trade = ib.placeOrder(contract, order)
+    
     await asyncio.sleep(2)  # ✅ Allow order execution time
     
     
@@ -255,7 +255,8 @@ async def place_order(symbol, quantity, action, limit_price, breakout_price=None
 
 # Monitor Active Trades
 async def monitor_trades(market_data_cache):
-    """Monitors active trades and adjusts stop-loss dynamically."""
+    """Monitors active trades and ensures stop-loss & take-profit are tracked."""
+
     open_positions = ib.positions()
 
     for position in open_positions:
@@ -263,32 +264,31 @@ async def monitor_trades(market_data_cache):
         quantity = position.position
         entry_price = trade_log.get(symbol, {}).get("entry_price")
         stop_loss = trade_log.get(symbol, {}).get("stop_loss")
-        
         take_profit = trade_log.get(symbol, {}).get("take_profit")
+
+        # ✅ Ensure we extract a single float value for current price
         current_price = market_data_cache.get(symbol, {}).get("close")
+        if isinstance(current_price, pd.Series):  # ✅ Convert Series to float
+            current_price = current_price.iloc[-1]
 
-        if not entry_price or not stop_loss or not take_profit or not current_price:
-            continue  # Skip if required data is missing
+        # ✅ Proper condition check
+        if entry_price is None or stop_loss is None or take_profit is None or current_price is None:
+            print(f"⚠ Missing trade data for {symbol}. Skipping monitoring.")
+            continue
 
-        # ✅ Adjust stop-loss only if price is rising but below take-profit
-        if current_price > entry_price and current_price < take_profit:
-            new_stop_loss = current_price * 0.99  # Adjust stop-loss to 1% below current price
-            
-            if new_stop_loss > stop_loss:  # ✅ Ensure stop-loss only moves up
-                print(f"📈 Adjusting Stop-Loss for {symbol}: Old: ${stop_loss:.2f} → New: ${new_stop_loss:.2f}")
-                trade_log[symbol]["stop_loss"] = new_stop_loss  # ✅ Update stop-loss in trade log
+        print(f"📊 Monitoring {symbol} | Entry: ${entry_price:.2f} | Stop-Loss: ${stop_loss:.2f} | Take-Profit: ${take_profit:.2f} | Current: ${current_price:.2f}")
 
-        # ✅ Exit trade if stop-loss is hit
+        # ✅ Execute Stop-Loss
         if current_price <= stop_loss:
             print(f"🚨 STOP-LOSS HIT: Selling {symbol} at ${current_price:.2f} (Stop-Loss: ${stop_loss:.2f})")
-            await place_order(symbol, quantity, "SELL", current_price * 0.995)  # Sell slightly below market price
-            trade_log.pop(symbol, None)  # ✅ Remove from trade log after selling
+            await place_order(symbol, quantity, "SELL", current_price * 0.995)
+            trade_log.pop(symbol, None)
 
-        # ✅ Exit trade if take-profit is hit
+        # ✅ Execute Take-Profit
         if current_price >= take_profit:
             print(f"🎯 TAKE-PROFIT HIT: Selling {symbol} at ${current_price:.2f} (Target: ${take_profit:.2f})")
-            await place_order(symbol, quantity, "SELL", current_price * 1.005)  # Sell slightly above market price
-            trade_log.pop(symbol, None)  # ✅ Remove from trade log after selling
+            await place_order(symbol, quantity, "SELL", current_price * 1.005)
+            trade_log.pop(symbol, None)
 
 
 # Run Trading Strategy
